@@ -1,6 +1,7 @@
 (function () {
-  const CACHE_KEY = "welcome-info-v2"; // 升级版本号，避免旧的英文缓存继续显示
-  const CACHE_TTL = 12 * 60 * 60 * 1000; // 12 小时缓存，避免每次刷新都请求接口
+  const CACHE_KEY = "welcome-info-v3"; // 升级版本号，让只含省份的旧缓存失效
+  const CACHE_TTL = 12 * 60 * 60 * 1000; // 正常缓存 12 小时
+  const DEGRADED_TTL = 30 * 60 * 1000; // 腾讯失败走兜底时只缓存 30 分钟，便于额度恢复后自动切回
   const DEFAULT_NAME = "Lorraine";
 
   // 省份问候语
@@ -66,11 +67,11 @@
     }
   }
 
-  function writeCache(data) {
+  function writeCache(data, ttl = CACHE_TTL) {
     try {
       localStorage.setItem(
         CACHE_KEY,
-        JSON.stringify({ expires: Date.now() + CACHE_TTL, data })
+        JSON.stringify({ expires: Date.now() + ttl, data })
       );
     } catch (e) {
       // 隐私模式下 localStorage 不可用，忽略即可
@@ -135,7 +136,7 @@
   function render(el, payload, blogLat, blogLng) {
     const result = payload.result || {};
     const ip = result.ip || "未知";
-    const ad = result.ad_info || {};
+    const ad = normalizePayload(payload).result.ad_info;
     const loc = result.location || {};
     const { address, greeting } = resolveLocation(ad);
     const dist = distance(blogLat, blogLng, loc.lat, loc.lng);
@@ -165,10 +166,16 @@
         script.remove();
         delete window.QQmap;
       }
-      script.src = `https://apis.map.qq.com/ws/location/v1/ip?key=${encodeURIComponent(key)}&output=jsonp`;
+      script.src = `https://apis.map.qq.com/ws/location/v1/ip?key=${encodeURIComponent(key)}&output=jsonp&callback=QQmap`;
       window.QQmap = (data) => {
         cleanup();
-        data.status === 0 ? resolve(data) : reject(new Error("IP 定位失败"));
+        if (data && data.status === 0) resolve(data);
+        else
+          reject(
+            new Error(
+              `IP 定位失败 (status=${data && data.status}): ${(data && data.message) || "无有效返回"}`
+            )
+          );
       };
       script.onerror = () => {
         cleanup();
@@ -242,6 +249,14 @@
     Zhumadian: "驻马店市", Huanggang: "黄冈市", Yangjiang: "阳江市",
     Huainan: "淮南市", Wuhu: "芜湖市", Bengbu: "蚌埠市",
     "Hong Kong": "香港", Macau: "澳门", Taipei: "台北市",
+    // 江苏地市及常见县级市（腾讯只返回省级时用公共接口补全）
+    Lianyungang: "连云港市", "Huai'an": "淮安市", Huaian: "淮安市",
+    Zhenjiang: "镇江市", Suqian: "宿迁市", Kunshan: "昆山市",
+    Jiangyin: "江阴市", Changshu: "常熟市", Zhangjiagang: "张家港市",
+    Yixing: "宜兴市", Danyang: "丹阳市", Qidong: "启东市",
+    Gaoyou: "高邮市", Xinghua: "兴化市", Taixing: "泰兴市",
+    Jingjiang: "靖江市", Dongtai: "东台市", Pizhou: "邳州市",
+    Xinyi: "新沂市", Jurong: "句容市",
   };
 
   // ipwho.is 会返回 "Jiangsu Sheng" 这类带后缀的写法，先清洗再查表
@@ -274,6 +289,42 @@
     };
   }
 
+  // 渲染前统一归一化（对中文数据幂等，可兼容旧缓存里的英文地名）
+  function normalizePayload(payload) {
+    const result = (payload && payload.result) || {};
+    const ad = result.ad_info || {};
+    return {
+      ...payload,
+      result: {
+        ...result,
+        ad_info: {
+          nation: toCN(ad.nation, NATION_CN) || ad.nation || "未知",
+          province: toCN(ad.province, REGION_CN),
+          city: toCN(ad.city, CITY_CN),
+          district: ad.district || "",
+        },
+      },
+    };
+  }
+
+  // 腾讯 IP 库有时只定位到省级，用公共接口 + 映射表补出城市
+  async function enrichCity(payload) {
+    const ad = payload && payload.result && payload.result.ad_info;
+    if (!ad || ad.nation !== "中国" || ad.city) return payload;
+    if (ad.district) {
+      ad.city = ad.district;
+      return payload;
+    }
+    try {
+      const fallback = await queryPublic();
+      const city = fallback && fallback.result && fallback.result.ad_info.city;
+      if (city) ad.city = city;
+    } catch (e) {
+      // 补全失败保持只显示省份，不阻塞卡片
+    }
+    return payload;
+  }
+
   function injectStyles() {
     if (document.getElementById("welcome-info-style")) return;
     const style = document.createElement("style");
@@ -303,21 +354,26 @@
       return;
     }
 
+    let data;
+    let degraded = false;
     try {
-      const data = key ? await queryTencent(key) : await queryPublic();
-      writeCache(data);
-      render(el, data, lat, lng);
+      data = key ? await queryTencent(key) : await queryPublic();
     } catch (e) {
       // 腾讯接口失败时回退公共接口
+      degraded = true;
+      console.warn("[welcome] 腾讯 IP 定位失败，回退公共接口:", e.message);
       try {
-        const data = await queryPublic();
-        writeCache(data);
-        render(el, data, lat, lng);
+        data = await queryPublic();
       } catch (err) {
         el.remove();
         console.warn("[welcome] 访客信息获取失败:", err);
+        return;
       }
     }
+    data = normalizePayload(data);
+    await enrichCity(data);
+    writeCache(data, degraded ? DEGRADED_TTL : CACHE_TTL);
+    render(el, data, lat, lng);
   }
 
   document.addEventListener("DOMContentLoaded", init);
